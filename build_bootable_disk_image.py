@@ -68,6 +68,16 @@ public domain without any warranty. For details, refer to the LICENSE file
 distributed with this program, or, if it's missing, to:
   - https://github.com/stepleton/bootloader_hd/blob/master/LICENSE
 For further information, visit http://unlicense.org.
+
+
+Revision history
+----------------
+
+This section records the development of this file as part of the
+`bootloader_hd` project at <http://github.com/stepleton/bootloader_hd>.
+
+30 March 2020: Initial release.
+(Tom Stepleton, stepleton@gmail.com, London)
 """
 
 import argparse
