@@ -8,6 +8,11 @@ a hard drive and loads a program from blocks immediately following. It can run
 from a hard drive connected to any ordinary Lisa parallel port: fixed/internal
 or on an expansion card.
 
+The bootloader includes the Apple parallel port hard drive I/O library from the
+[`lisa_io`](https://github.com/stepleton/lisa_io) project. This library remains
+memory-resident after loading, and loaded programs can use it to read and write
+hard drive blocks if desired.
+
 
 Documentation
 -------------
