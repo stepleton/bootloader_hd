@@ -78,6 +78,8 @@ This section records the development of this file as part of the
 
 30 March 2020: Initial release.
 (Tom Stepleton, stepleton@gmail.com, London)
+
+6 February 2021: Support for truncated image files (--clip). (Tom Stepleton)
 """
 
 import argparse
@@ -124,14 +126,25 @@ def _define_flags():
                      help=('Number of blocks in the disk image: specify 0 to '
                            'use the default for the device specified by the '
                            '--device flag, and beware that nonstandard sizes '
-                           'may yield unexpected results in different '
-                           'applications'),
+                           'may not work with most emulators or utility '
+                           'programs'),
                      type=int)
 
   flags.add_argument('-o', '--output',
                      help=('Where to write the resulting disk image; if '
                            'unspecified, the image is written to standard out'),
                      type=argparse.FileType('xb'))
+
+  clipflag = flags.add_mutually_exclusive_group(required=False)
+  clipflag.add_argument('-c', '--clip', dest='clip', action='store_true',
+                        help=('Clip disk images to only the blocks required to '
+                              'store the bootloader and the program; may not '
+                              'be sensible if your program intends to write '
+                              'to the drive image at any point; images may not '
+                              'work with most emulators or utility programs'))
+  clipflag.add_argument('--noclip', dest='clip', action='store_false',
+                        help=argparse.SUPPRESS)
+  flags.set_defaults(clip=False)
 
   flags.add_argument('-t', '--tags_file',
                      help=('Text file listing per-block loading display tags, '
@@ -155,9 +168,9 @@ _DEFAULT_NUM_BLOCKS = {'profile': 0x2600,
 
 _TAG_FOR_LAST_BLOCK = b' bit.ly/3arucNJ  \x00'
 
-# This built-in bootloader binary is the version released on TODO. It's quite
-# a bit larger than the "Stepleton" floppy disk bootloader, but there's an
-# entire ProFile I/O library in there...
+# This built-in bootloader binary is the version released on 30 March 2020.
+# It's quite a bit larger than the "Stepleton" floppy disk bootloader, but
+# there's an entire ProFile I/O library in there...
 _BUILT_IN_BOOTLOADER = textwrap.dedent("""\
     WW8hIKqqIEknbSBib290YWJsZSEQOAGzYRphAACcckDliTQ8CgNB+gHsYQABKmcAAvBOQDI8APxI
     QTI83YEiQZL8BIB0BFcAaxxRAGoYdBAyPOABBEFAAFYAa/hTAGcEBkEIACJBQfoAKiDB0kIgwUXp
@@ -203,7 +216,7 @@ def main(FLAGS):
   # Load program; if smaller than the disk data capacity minus 1024 (for the
   # blocks already used by the bootloader), pad it out with zeros.
   program, program_size = _read_binary_data(
-      FLAGS.program, 0x200 * num_blocks - 0x400, 'program')
+      FLAGS.program, 0x200 * num_blocks - 0x400, 'program', FLAGS.clip)
   program_blocks = math.ceil(program_size / 0x200)
 
   # Chop program into per-block data.
@@ -240,17 +253,22 @@ def _read_binary_data(
     fp: IO,
     size: int,
     name: str,
+    clip: bool = False,
 ) -> Tuple[bytes, int]:
   """Read zero-padded binary data from a file.
 
   Attempts to read `size+1` bytes from filehandle `fp`. If 0 or more than `size`
   bytes are read, raises an IOError. Data of any other size is returned to the
-  caller, followed by enough zero padding to yield `size` bytes exactly.
+  caller, followed by enough zero padding to yield `size` bytes exactly (if
+  `clip` is False) or to yield the nearest larger multiple of 0x200 (if `clip`
+  is True).
 
   Args:
     fp: file object to read from.
     size: number of bytes to read from `fp`.
     name: name for data being loaded (used for exception messages).
+    clip: whether to pad binary data with 0s to the nearest larger multiple of
+        0x200 (if True) or to `size` (if False).
 
   Returns: a 2-tuple whose members are the data loaded from `fp` (zero-padded)
       and the original size of the data in bytes prior to zero-padding.
@@ -266,7 +284,10 @@ def _read_binary_data(
     raise IOError(f'{name} data file was larger than {size} bytes')
 
   # Zero-pad and return.
-  return data + (b'\x00' * (size - len(data))), len(data)
+  if clip:
+    return data + (b'\x00' * (0x200 + ~((len(data)-1) & 0x1ff))), len(data)
+  else:
+    return data + (b'\x00' * (size - len(data))), len(data)
 
 
 def _checksum(block: bytes) -> bytes:
@@ -486,8 +507,8 @@ def _make_apple_parallel_drive_image_blu(
     device: Device type string (cf. documentation for the --device flag); not
         used by this function for now.
 
-  Returns: Binary data of a LisaEm-compatible .dc42 disk image, ready to be
-      written to a file.
+  Returns: Binary data of a BLU-compatible disk image, ready to be written to a
+      file.
   """
   ID_DATA = {
       'profile': (
@@ -505,7 +526,7 @@ def _make_apple_parallel_drive_image_blu(
       'profile-10': (
           b'PROFILE 10M  '  # Device name. This indicates a 10MB ProFile.
           b'\x00\x00\x01'   # Device number. Also means "10MB ProFile".
-          b'\x06\x06'       # Firmware revision $0606.
+          b'\x04\x04'       # Firmware revision $0404.
           b'\x00\x4C\x00'   # Blocks available. 19,456 blocks.
           b'\x02\x14'       # Block size. 532 bytes.
           b'\x20'           # Spare blocks on device. 32 blocks.
