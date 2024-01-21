@@ -80,6 +80,9 @@ This section records the development of this file as part of the
 (Tom Stepleton, stepleton@gmail.com, London)
 
 6 February 2021: Support for truncated image files (--clip). (Tom Stepleton)
+
+21 January 2024: Improved organisation to support use of this module in other
+programs. (Tom Stepleton)
 """
 
 import argparse
@@ -88,8 +91,9 @@ import math
 import struct
 import sys
 import textwrap
-from typing import IO, Iterator, List, Sequence, Tuple, Union
 import warnings
+
+from typing import IO, Iterator, List, Optional, Sequence, Tuple, Union
 
 
 def _define_flags():
@@ -98,8 +102,8 @@ def _define_flags():
       description='Build a bootable Apple Lisa hard disk image')
 
   flags.add_argument('program',
-                     help=('68000 machine code program to load+run (starting '
-                           'address $800)'),
+                     help=('Raw 68000 machine code program binary to load+run '
+                           '(starting address $800)'),
                      type=argparse.FileType('rb'))
 
   flags.add_argument('-f', '--format',
@@ -111,7 +115,7 @@ def _define_flags():
                            'Cameo/Aphid hard drive emulator and with IDLE, and '
                            'usbwidex is a disk image suitable for use with the '
                            'UsbWidEx hard drive diagnostic tool.'),
-                     choices=['dc42', 'blu', 'raw', 'usbwidex'],
+                     choices=IMAGE_FORMATS,
                      default='dc42')
 
   flags.add_argument('-d', '--device',
@@ -119,15 +123,16 @@ def _define_flags():
                            'this flag primarily determines the default number '
                            'of blocks on the device and otherwise only affects '
                            'the formatting of "blu" disk images'),
-                     choices=['profile', 'profile-10', 'widget'],
+                     choices=DEVICES,
                      default='profile')
 
   flags.add_argument('-k', '--blocks',
                      help=('Number of blocks in the disk image: specify 0 to '
                            'use the default for the device specified by the '
-                           '--device flag, and beware that nonstandard sizes '
-                           'may not work with most emulators or utility '
-                           'programs'),
+                           '--device flag or the minimal "clipped" length '
+                           'calculated when --clip is set, and beware that '
+                           'nonstandard sizes may not work with most '
+                           'emulators or utility programs'),
                      type=int)
 
   flags.add_argument('-o', '--output',
@@ -162,11 +167,24 @@ def _define_flags():
   return flags
 
 
-_DEFAULT_NUM_BLOCKS = {'profile': 0x2600,
-                       'profile-10': 0x4c00,
-                       'widget': 0x4c00}
+# The number of 532-byte blocks in complete drive images of:
+_DEFAULT_NUM_BLOCKS = {'profile': 0x2600,     # A 5 "megabyte" ProFile drive.
+                       'profile-10': 0x4c00,  # A 10 "megabyte" ProFile.
+                       'widget': 0x4c00}      # A 10 "megabyte" Widget drive.
 
-_TAG_FOR_LAST_BLOCK = b' bit.ly/3arucNJ  \x00'
+# Names of the disk image formats that this code can generate. For more
+# information about the formats these names refer to, see the module docstring
+# and the documentation for the --format flag.
+IMAGE_FORMATS = ('dc42', 'blu', 'raw', 'usbwidex')
+# Names of Apple parallel hard drive devices that disk images can pretend to
+# be imaged from. For more information about how and when these names are used,
+# see the documentation for the --device flag.
+DEVICES = tuple(_DEFAULT_NUM_BLOCKS)
+
+# This 18 byte sequence makes up all but the first two (checksum) bytes of the
+# last block that the bootloader should load from the disk. It is not shown to
+# the user.
+TAG_FOR_LAST_BLOCK = b' bit.ly/3arucNJ  \x00'
 
 # This built-in bootloader binary is the version released on 30 March 2020.
 # It's quite a bit larger than the "Stepleton" floppy disk bootloader, but
@@ -195,58 +213,158 @@ def main(FLAGS):
   # No output file listed? Use stdout in binary mode.
   output_file = FLAGS.output or sys.stdout.buffer
 
-  # Compute the number of blocks of program data to place in the image. Make
-  # sure the number of blocks is sensible.
-  num_blocks = FLAGS.blocks or _DEFAULT_NUM_BLOCKS[FLAGS.device]
-  if num_blocks < 3: raise ValueError(
-    f'A disk image of {num_blocks} blocks has no room for any program data')
-
-  # Load bootloader data. If no file is specified, use the built-in bootloader.
-  # If data is less than 1064 bytes long, pad out with zeros.
+  # If a file containing a bootloader is specified, load it; otherwise specify
+  # None to use the default bootloader.
   if FLAGS.bootloader:
     bootloader, _ = _read_binary_data(FLAGS.bootloader, 1064, 'bootloader')
   else:
-    bootloader = base64.decodebytes(bytes(_BUILT_IN_BOOTLOADER, 'ascii'))
-    bootloader += b'\x00' * (1064 - len(bootloader))
+    bootloader = None
+
+  # Load program; if smaller than the disk data capacity minus 1024 (for the
+  # blocks already used by the bootloader), pad it out with zeros, unless
+  # clipping is desired.
+  program, program_size = _read_binary_data(
+      FLAGS.program, 0x200 * num_blocks - 0x400, 'program', FLAGS.clip)
+  program_blocks = math.ceil(program_size / 0x200)
+
+  # If clipping is specified without the number of blocks specified, then all
+  # the blocks we need are the two for the program plus two more for the
+  # bootloader. Otherwise we go with the value in the --blocks flag, which can
+  # be zero to defer to the number of blocks entailed by the --device flag.
+  num_blocks = ((program_blocks + 2)
+                if FLAGS.clip and not FLAGS.blocks else FLAGS.blocks)
+
+  # Make the bootloader and tag data for the drive.
+  tags, data = make_tags_and_data(
+      device=FLAGS.device, program=program,
+      bootloader=bootloader, display_tags=tags_file,
+      num_blocks=num_blocks)
+
+  # Compile into a drive image.
+  image = make_drive_image(tags, data, FLAGS.format, FLAGS.device)
+
+  # Write image to output
+  output_file.write(image)
+
+
+# returns: data data, tags data
+def make_tags_and_data(
+    device: str,
+    program: bytes,
+    bootloader: Optional[bytes] = None,
+    display_tags: Optional[Iterator[str]] = None,
+    num_blocks: Optional[int] = None,
+) -> Tuple[List[bytes], List[bytes]]:
+  """Create block data and block tags for a bootable hard drive image.
+
+  Args:
+    device: Device type string (valid values are listed in the DEVICES tuple
+        and documented at the --device flag definition).
+    program: Raw 68000 machine code program binary to load and run (starting
+        address $800).
+    bootloader: Raw 68000 machine code bootloader binary; if unspecified or
+        None, will use bootloader data built into the module.
+    display_tags: An iterator over up to 18-byte strings to display while
+        loading blocks of program data; must use only characters in
+        "0-9A-Z ./-?". If unspecified or None, will use "default" display tags.
+    num_blocks: Generate block data and block tags for exactly this many
+        blocks; if unspecified or None, will create these for as many blocks
+        are present on the device named by the `device` argument.
+
+  Returns:
+    [1] A list of 20-byte binary tags, one for each block in the drive image.
+    [2] A list of 512-byte binary data blocks, one for each block in the image.
+  """
+  # Early argument checking.
+  if device not in DEVICES: raise ValueError(
+      f'Invalid drive device type "{device}"; valid drive device types are ' +
+      ', '.join(f'"{d}"' for d in DEVICES))
+
+  # Fill in default values where unspecified, plus a bit more arg checking.
+  bootloader = (bootloader or
+                base64.decodebytes(bytes(_BUILT_IN_BOOTLOADER, 'ascii')))
+  display_tags = display_tags or DefaultTags()
+  num_blocks = num_blocks or _DEFAULT_NUM_BLOCKS[device]
+  if num_blocks < 3: raise ValueError(
+    f'A disk image of {num_blocks} blocks has no room for any program data')
+
+  # Pad bootloader to two full blocks; complain if it's bigger than that.
+  if len(bootloader) > 1064: raise ValueError(
+      f'Bootloader was {len(bootloader)} bytes long, but can be no larger '
+      'than 1064 bytes (two 532-byte blocks)')
+  bootloader += b'\x00' * (1064 - len(bootloader))
 
   # Chop bootloader into per-block data and tags for the first two blocks.
   bootloader_data = [bootloader[20:532], bootloader[552:]]
   bootloader_tags = [bootloader[:20], bootloader[532:552]]
 
-  # Load program; if smaller than the disk data capacity minus 1024 (for the
-  # blocks already used by the bootloader), pad it out with zeros.
-  program, program_size = _read_binary_data(
-      FLAGS.program, 0x200 * num_blocks - 0x400, 'program', FLAGS.clip)
+  # Pad program data out to 512 * the number of blocks in the image less two
+  # (to accommodate the bootloader). (It's 512 because that's the number of
+  # data bytes in a block; the 20 extra bytes are the tag bytes.)
+  program_size = len(program)  # Pre-padding size of the original program
+  data_space = 0x200 * (num_blocks - 2)  # Total non-tag bytes in the image
+  if data_space < program_size: raise ValueError(
+      f'Program data of length {program_size} bytes exceeds the {data_space} '
+      f'non-bootloader bytes available in a {num_blocks}-block {device} image')
+  program += b'\x00' * (data_space - program_size)
+
+  # How many blocks does the program occupy prior to padding?
   program_blocks = math.ceil(program_size / 0x200)
 
-  # Chop program into per-block data.
+  # Chop padded program into per-block data.
   program_data = [program[i:i+0x200] for i in range(0, len(program), 0x200)]
 
   # Compute the per-block checksums that the bootloader uses to verify the
   # program's integrity, then assemble tags for the program data.
-  program_checksums = [_checksum(d) for d in program_data[:program_blocks]]
-  program_tags = [c + _read_next_tag(tags_file) for c in program_checksums[:-1]]
-  program_tags.append(program_checksums[-1] + _TAG_FOR_LAST_BLOCK)
+  program_checksums = [checksum(d) for d in program_data[:program_blocks]]
+  program_tags = [c + _read_next_tag(display_tags)
+                  for c in program_checksums[:-1]]
+  program_tags.append(program_checksums[-1] + TAG_FOR_LAST_BLOCK)
   program_tags.extend([b'\x00' * 20] * (num_blocks - program_blocks - 2))
 
-  # Combine tags and data for all blocks.
-  data = bootloader_data + program_data
+  # Combine tags and data for all blocks, and return
   tags = bootloader_tags + program_tags
+  data = bootloader_data + program_data
+  return tags, data
 
-  # Compile into a drive image.
-  if FLAGS.format == 'dc42':
-    image = _make_apple_parallel_drive_image_dc42(tags, data, FLAGS.device)
-  elif FLAGS.format == 'blu':
-    image = _make_apple_parallel_drive_image_blu(tags, data, FLAGS.device)
-  elif FLAGS.format == 'raw':
-    image = b''.join(sum(zip(tags, data), ()))
-  elif FLAGS.format == 'usbwidex':  # It's "raw" w/sectors padded to 1024 bytes.
-    image = b''.join([t + d + b'\x00' * 0x1ec for t, d in zip(tags, data)])
+
+def make_drive_image(
+    tags: Sequence[bytes],
+    data: Sequence[bytes],
+    image_format: str,
+    device: str,
+) -> bytes:
+  """Compile per-block tags and data into one of several disk image formats.
+
+  Compiles `tags` and `data` into disk image data representing data on a
+  specified disk device. For more information about the image formats made by
+  this function, see the module docstring and documentation at the definition
+  of the --format flag; likewise, for information about device types, refer to
+  the --device flag.
+
+  Args:
+    tags: 20-byte block tags to place in the disk image, in linear order.
+    data: 512-byte block data records to place in the disk image, in linear
+        order.
+    image_format: Image format string (valid values are listed in the
+        IMAGE_FORMATS tuple and documented at the --format flag definition
+        and in the module docstring).
+    device: Device type string (valid values are listed in the DEVICES tuple
+        and documented at the --device flag definition).
+
+  Returns: Binary data of a LisaEm-compatible .dc42 disk image, ready to be
+      written to a file.
+  """
+  if image_format == 'dc42':
+    return _make_apple_parallel_drive_image_dc42(tags, data, device)
+  elif image_format == 'blu':
+    return _make_apple_parallel_drive_image_blu(tags, data, device)
+  elif image_format == 'raw':
+    return b''.join(sum(zip(tags, data), ()))
+  elif image_format == 'usbwidex':  # It's "raw" w/sectors padded to 1024 bytes.
+    return b''.join([t + d + b'\x00' * 0x1ec for t, d in zip(tags, data)])
   else:
-    raise ValueError(f'Unrecognised disk image format {FLAGS.format}')
-
-  # Write image to output
-  output_file.write(image)
+    raise ValueError(f'Unrecognised disk image format {format}')
 
 
 def _read_binary_data(
@@ -290,7 +408,7 @@ def _read_binary_data(
     return data + (b'\x00' * (size - len(data))), len(data)
 
 
-def _checksum(block: bytes) -> bytes:
+def checksum(block: bytes) -> bytes:
   """Compute add-and-shift-left-1 16-bit big-endian checksum."""
   checksum = 0
   for i in range(0, len(block), 2):
@@ -390,8 +508,9 @@ def _make_apple_parallel_drive_image_dc42(
     tags: 20-byte block tags to place in the disk image, in linear order.
     data: 512-byte block data records to place in the disk image, in linear
         order.
-    device: Device type string (cf. documentation for the --device flag); not
-        used by this function for now.
+    device: Device type string (valid values are listed in the DEVICES tuple
+        and documented at the --device flag definition); not used by this
+        function for now.
 
   Returns: Binary data of a LisaEm-compatible .dc42 disk image, ready to be
       written to a file.
@@ -504,8 +623,8 @@ def _make_apple_parallel_drive_image_blu(
     tags: 20-byte block tags to place in the disk image, in linear order.
     data: 512-byte block data records to place in the disk image, in linear
         order.
-    device: Device type string (cf. documentation for the --device flag); not
-        used by this function for now.
+    device: Device type string (valid values are listed in the DEVICES tuple
+        and documented at the --device flag definition).
 
   Returns: Binary data of a BLU-compatible disk image, ready to be written to a
       file.
